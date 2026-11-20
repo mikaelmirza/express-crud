@@ -1,0 +1,14 @@
+# Tells Grafana (in the lgtm container) to load this repo's dashboards.
+# Mounted into /otel-lgtm/grafana/conf/provisioning/dashboards/ by docker-compose.yml.
+apiVersion: 1
+
+providers:
+  - name: express-crud
+    type: file
+    folder: express-crud
+    # Edits made in the Grafana UI are kept until the file changes. To keep an
+    # edit, export the dashboard JSON over grafana/dashboards/express-crud.json.
+    allowUiUpdates: true
+    updateIntervalSeconds: 10
+    options:
+      path: /otel-lgtm/express-crud-dashboards

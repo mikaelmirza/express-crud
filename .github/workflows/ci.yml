@@ -1,0 +1,124 @@
+# Runs on every push to main and every pull request:
+#   test  - the full test suite against a real Postgres
+#   image - builds the production Docker image, starts it with Postgres, runs
+#           the smoke test against it, and checks it shuts down gracefully
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only: nothing here pushes, comments or publishes
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR cancels the run it replaces
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # The database .env.test points at
+          POSTGRES_DB: express_crud_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d express_crud_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Runs migrations on the test database (pretest), then every test file.
+      # Settings come from .env.test, which is committed and has no real secrets.
+      - run: npm test
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Built once and loaded into Docker under the tag docker-compose.yml
+      # uses, so Compose runs this image instead of building its own.
+      # Layers are cached between runs in GitHub's Actions cache.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: express-crud:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate a throwaway JWT secret
+        run: echo "JWT_SECRET=$(openssl rand -base64 48)" >> "$GITHUB_ENV"
+
+      # Postgres and the app only: Grafana isn't needed, and the app drops
+      # telemetry quietly when no collector is running
+      - name: Start Postgres and the app
+        run: docker compose --profile app up -d --wait --wait-timeout 120 postgres app
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Smoke test
+        run: node scripts/smoke.js
+
+      - name: Check it logs JSON with request ids
+        run: |
+          docker compose --profile app logs --no-log-prefix app | grep "^{" > app.log
+          node -e '
+            const lines = require("fs").readFileSync("app.log", "utf8").trim().split("\n").map(JSON.parse);
+            const started = lines.find((l) => l["event.name"] === "server.started");
+            const requests = lines.filter((l) => l.request_id && l["http.route"]);
+            if (!started) throw new Error("no server.started line");
+            if (requests.length < 5) throw new Error("expected request lines, got " + requests.length);
+            console.log("ok: " + lines.length + " JSON lines, " + requests.length + " request lines");'
+
+      - name: Check graceful shutdown
+        run: |
+          docker compose --profile app stop app
+          code=$(docker inspect --format '{{.State.ExitCode}}' "$(docker compose --profile app ps -aq app)")
+          echo "exit code: $code"
+          docker compose --profile app logs --no-log-prefix app | grep -q '"event.name":"server.stopped"'
+          test "$code" = "0"
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose --profile app logs
+
+      - name: Clean up
+        if: always()
+        run: docker compose --profile app down -v

@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    # Postgres's default random_page_cost (4) assumes spinning disks and makes the
+    # planner skip the search indexes on mid-sized tables. 1.1 is the usual SSD /
+    # cloud value, so local query plans match production.
+    command: ["postgres", "-c", "random_page_cost=1.1"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: express_crud
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once on first start: creates the test database
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d express_crud"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Grafana's all-in-one OpenTelemetry backend for local development:
+  # an OpenTelemetry Collector plus Tempo (traces), Loki (logs), Prometheus
+  # (metrics) and Grafana, pre-wired together. Not meant for production.
+  # Data is kept only while the container exists.
+  lgtm:
+    image: grafana/otel-lgtm:0.11.5
+    ports:
+      - "3001:3000" # Grafana UI (the app already uses 3000)
+      - "4317:4317" # OTLP over gRPC
+      - "4318:4318" # OTLP over HTTP (what the app uses)
+    volumes:
+      # This repo's dashboard, loaded automatically (Dashboards → express-crud)
+      - ./grafana/provisioning/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/express-crud.yaml:ro
+      - ./grafana/dashboards:/otel-lgtm/express-crud-dashboards:ro
+    healthcheck:
+      # The image writes this file once every component is up
+      test: ["CMD-SHELL", "test -f /tmp/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+  # The app itself, in its production image. Off by default (profile "app"):
+  # in development you run it with `npm run dev`. Start everything with:
+  #
+  #   npm run app:up      (docker compose --profile app up -d --build --wait)
+  app:
+    profiles: [app]
+    build: .
+    image: express-crud:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Containers reach each other by service name, not localhost
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/express_crud
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+      # Read from your .env (Compose loads it for ${...} values). If it's
+      # missing, the app stops with an error saying how to generate one.
+      JWT_SECRET: ${JWT_SECRET:-}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    # Migrations run on start, which is convenient locally. In production,
+    # run them as a separate release step instead, so a failed migration
+    # doesn't crash-loop every instance:
+    #   docker compose run --rm app node scripts/migrate.js
+    # `exec` makes node PID 1, so it gets SIGTERM directly and shuts down gracefully.
+    command: ["sh", "-c", "node scripts/migrate.js && exec node --import ./src/instrumentation.js src/server.js"]
+    ports:
+      - "3000:3000"
+    # Longer than SHUTDOWN_TIMEOUT_MS (10s), so in-flight requests can finish
+    # before Docker gives up and sends SIGKILL
+    stop_grace_period: 15s
+
+volumes:
+  pgdata:

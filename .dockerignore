@@ -1,0 +1,14 @@
+# Keep the build context small, and secrets out of it. The Dockerfile copies
+# only what it needs, but everything here would otherwise be sent to the
+# Docker daemon on every build.
+node_modules
+.env
+.env.*
+!.env.example
+.git
+.github
+test
+grafana
+docker
+*.md
+npm-debug.log*
